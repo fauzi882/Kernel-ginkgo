@@ -1,0 +1,121 @@
+name: Recon 2 (Flop KSU Kconfig + selisih NetHunter)
+
+# Taruh di: .github/workflows/recon2-kernel.yml
+# Jalankan: tab Actions -> "Recon 2" -> Run workflow
+# Hasil: Summary run + artifact (report2.md, nethunter-extra.txt)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  recon2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Intip lebih dalam
+        shell: bash
+        run: |
+          set +e
+          set +o pipefail
+          R="$PWD/report2.md"
+          : > "$R"
+          sec() { printf '\n### %s\n```\n' "$1" >> "$R"; }
+          end() { printf '```\n' >> "$R"; }
+          x() { d="$1"; shift; ( cd "$d" && bash -c "$*" ) >> "$R" 2>&1; }
+
+          FLOP=https://github.com/FlopKernel-Series/flop_trinket-mi_kernel.git
+          IK=https://github.com/ikteach/ginkgo_nethunter_kernel.git
+
+          timeout 900 git clone --depth=60 -b floppy-unity "$FLOP" /tmp/flop >/dev/null 2>&1
+          timeout 900 git clone --depth=1 "$IK" /tmp/ik >/dev/null 2>&1
+          timeout 900 git clone --depth=1 -b statx "$IK" /tmp/ik-statx >/dev/null 2>&1
+          timeout 900 git clone --filter=tree:0 --no-checkout "$IK" /tmp/ik-hist >/dev/null 2>&1
+
+          echo "# Recon 2" >> "$R"
+
+          # ================= FLOP =================
+          echo "## FLOP (floppy-unity)" >> "$R"
+
+          sec "Isi root repo"
+          x /tmp/flop 'ls -1 | head -70'
+          end
+
+          sec "Folder KSU di drivers"
+          x /tmp/flop 'ls -d drivers/*ksu* drivers/*suki* drivers/*KernelSU* ; echo ---; ls drivers/kernelsu | head -50'
+          end
+
+          sec "Cara KSU dipasang ke build (Kconfig/Makefile induk)"
+          x /tmp/flop 'grep -n -i -E "ksu|susfs|suki" drivers/Kconfig drivers/Makefile fs/Kconfig fs/Makefile Makefile Kconfig | head -40'
+          end
+
+          sec "Kconfig tiap varian KSU (maks 120 baris per file)"
+          x /tmp/flop 'for k in drivers/kernelsu/Kconfig drivers/sukisu/Kconfig drivers/xxksu/Kconfig; do [ -f "$k" ] && { echo "--- $k"; head -120 "$k"; }; done'
+          end
+
+          sec "Isi fragment config (ginkgo + xiaomi-trinket)"
+          x /tmp/flop 'for f in arch/arm64/configs/vendor/ginkgo.config arch/arm64/configs/vendor/xiaomi-trinket.config; do echo "--- $f"; head -80 "$f"; done'
+          end
+
+          sec "Semua baris KSU/SUSFS di folder configs"
+          x /tmp/flop 'grep -rn -E "KSU|SUSFS" arch/arm64/configs | head -30'
+          end
+
+          sec "Skrip/dokumen build di repo"
+          x /tmp/flop 'ls -1 | grep -i -E "\.sh$|build|readme|\.md$"; echo ---; ls -a .github 2>&1; echo ---; ls scripts | grep -i -E "build|ksu|susfs|pack|strip"'
+          end
+
+          sec "Commit 'Adjustments for LKM support' dan commit terbaru"
+          x /tmp/flop 'git show --stat --format="%h %ad %s" --date=short 6904b6d521 | head -30; echo ---; git show --stat --format="%h %ad %s" --date=short f3bf1cf859 | head -15'
+          end
+
+          sec "Versi KSU Next (Makefile/Kbuild)"
+          x /tmp/flop 'grep -n -i -E "KSU_VERSION|3\.4\.0|legacy" drivers/kernelsu/Makefile drivers/kernelsu/Kbuild 2>/dev/null | head -12'
+          end
+
+          # ================= IKTEACH =================
+          echo "## IKTEACH" >> "$R"
+
+          sec "Commit a61fd9453af5 (yang ada di HP) ada di repo?"
+          x /tmp/ik-hist 'git cat-file -t a61fd9453af5; echo "exit=$?"'
+          end
+
+          sec "Branch statx: versi kernel + commit terakhir"
+          x /tmp/ik-statx 'head -5 Makefile; git log -3 --format="%h %ad | %s" --date=short'
+          end
+
+          sec "Daftar defconfig (root + vendor)"
+          x /tmp/ik 'ls -1 arch/arm64/configs | head -60; echo ---; ls -1 arch/arm64/configs/vendor | head -40'
+          end
+
+          sec "Driver wireless di drivers/net/wireless"
+          x /tmp/ik 'ls -1 drivers/net/wireless | head -60'
+          end
+
+          # ============ SELISIH NETHUNTER vs FLOP ============
+          echo "## SELISIH FITUR (ikteach nethunter_defconfig vs Flop trinket-perf_defconfig)" >> "$R"
+
+          A=/tmp/ik/arch/arm64/configs/nethunter_defconfig
+          B=/tmp/flop/arch/arm64/configs/vendor/trinket-perf_defconfig
+          grep -E '^CONFIG_[A-Za-z0-9_]+=(y|m)' "$A" | sed 's/=.*//' | sort -u > /tmp/a.txt
+          grep -E '^CONFIG_[A-Za-z0-9_]+=(y|m)' "$B" | sed 's/=.*//' | sort -u > /tmp/b.txt
+          comm -23 /tmp/a.txt /tmp/b.txt > "$PWD/nethunter-extra.txt"
+
+          sec "Jumlah opsi yang aktif di ikteach tapi tidak aktif di Flop"
+          wc -l < "$PWD/nethunter-extra.txt" >> "$R"
+          end
+
+          sec "Yang relevan NetHunter (disaring, maks 150)"
+          grep -i -E 'WIRELESS|80211|CFG80211|RTL|ATH|RT2|RT28|ZD12|MT7|HID|RNDIS|CH341|PL2303|FTDI|USB_SERIAL|BT_|BLUETOOTH|CAN|DVB|RADIO|SYSVIPC|FHANDLE|DEVTMPFS|CGROUP|NAMESPACES|USB_NET|USB_GADGET|CONFIGFS|_F_' "$PWD/nethunter-extra.txt" | head -150 >> "$R"
+          end
+
+          cat "$R"
+          cat "$R" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload laporan
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon2
+          path: |
+            report2.md
+            nethunter-extra.txt
+            
