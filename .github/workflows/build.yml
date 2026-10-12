@@ -39,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip unzip lz4 xz-utils python3 \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi git curl wget lsb-release gnupg software-properties-common
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi ccache git curl wget lsb-release gnupg software-properties-common
 
       - name: Install clang 19
         shell: bash
@@ -49,6 +49,25 @@ jobs:
           sudo ./llvm.sh 19
           sudo apt-get install -y llvm-19 lld-19
           /usr/lib/llvm-19/bin/clang --version | head -1
+
+      - name: Restore cache ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: |
+            ccache-
+
+      - name: Siapkan ccache
+        shell: bash
+        run: |
+          mkdir -p /tmp/cc
+          ln -sf "$(which ccache)" /tmp/cc/clang
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=3G" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          ccache -z || true
 
       - name: Clone repo
         shell: bash
@@ -125,7 +144,7 @@ jobs:
         shell: bash
         working-directory: kernel
         run: |
-          export PATH=/usr/lib/llvm-19/bin:$PATH
+          export PATH=/tmp/cc:/usr/lib/llvm-19/bin:$PATH
           make $MAKE_ARGS vendor/trinket-perf_defconfig vendor/ginkgo.config vendor/xiaomi-trinket.config $FRAGS
 
       - name: Cek config akhir
@@ -144,12 +163,29 @@ jobs:
             exit 1
           fi
 
+      - name: Fix konflik simbol ath9k_htc vs qcacld
+        if: ${{ inputs.nethunter }}
+        shell: bash
+        working-directory: kernel
+        run: |
+          # ath9k_htc dan qcacld (WiFi bawaan) sama-sama punya htc_start, htc_stop, htc_connect_service.
+          # Ganti nama versi ath9k supaya tidak bentrok saat link built-in.
+          D=drivers/net/wireless/ath/ath9k
+          grep -rlE '\bhtc_(start|stop|connect_service)\b' $D | xargs -r sed -i -E 's/\bhtc_(start|stop|connect_service)\b/htc_\1_ath9k/g'
+          echo "Hasil rename di ath9k:"
+          grep -rnE 'htc_(start|stop|connect_service)_ath9k' $D | head -20
+
       - name: Build kernel
         shell: bash
         working-directory: kernel
         run: |
-          export PATH=/usr/lib/llvm-19/bin:$PATH
+          export PATH=/tmp/cc:/usr/lib/llvm-19/bin:$PATH
           make $MAKE_ARGS -j"$(nproc --all)" 2>&1 | tee ../build.log
+
+      - name: Statistik ccache
+        if: always()
+        shell: bash
+        run: ccache -s || true
 
       - name: Bungkus AnyKernel3
         shell: bash
@@ -216,4 +252,11 @@ jobs:
             build.log
             final.config
           if-no-files-found: ignore
+
+      - name: Simpan cache ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.run_id }}
           
