@@ -1,121 +1,219 @@
-name: Recon 2 (Flop KSU Kconfig + selisih NetHunter)
+name: Build Ginkgo (Flop + KSU + SuSFS + NetHunter)
 
-# Taruh di: .github/workflows/recon2-kernel.yml
-# Jalankan: tab Actions -> "Recon 2" -> Run workflow
-# Hasil: Summary run + artifact (report2.md, nethunter-extra.txt)
+# Taruh di: .github/workflows/build-ginkgo.yml
+# Jalankan: Actions -> "Build Ginkgo" -> Run workflow
+# Hasil: artifact berisi zip AnyKernel3 + build.log + final.config
 
 on:
   workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: "Varian KSU: suki (ReSukiSU) / next (KernelSU Next legacy) / xxksu"
+        type: choice
+        options:
+          - suki
+          - next
+          - xxksu
+        default: suki
+      nethunter:
+        description: "Tambah config NetHunter in-tree (WiFi USB, BT, CAN, HID gadget, SYSVIPC)"
+        type: boolean
+        default: true
+      flop_branch:
+        description: "Branch repo Flop"
+        type: string
+        default: floppy-unity
 
 jobs:
-  recon2:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 150
+    env:
+      VARIANT: ${{ inputs.ksu_variant }}
+      NH: ${{ inputs.nethunter }}
+      FLOP_BRANCH: ${{ inputs.flop_branch }}
+      MAKE_ARGS: "O=out ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- KCFLAGS=-Wno-error"
     steps:
-      - name: Intip lebih dalam
+      - name: Install dependensi
         shell: bash
         run: |
-          set +e
-          set +o pipefail
-          R="$PWD/report2.md"
-          : > "$R"
-          sec() { printf '\n### %s\n```\n' "$1" >> "$R"; }
-          end() { printf '```\n' >> "$R"; }
-          x() { d="$1"; shift; ( cd "$d" && bash -c "$*" ) >> "$R" 2>&1; }
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip unzip lz4 xz-utils python3 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi git curl wget lsb-release gnupg software-properties-common
 
-          FLOP=https://github.com/FlopKernel-Series/flop_trinket-mi_kernel.git
-          IK=https://github.com/ikteach/ginkgo_nethunter_kernel.git
+      - name: Install clang 19
+        shell: bash
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          sudo apt-get install -y llvm-19 lld-19
+          /usr/lib/llvm-19/bin/clang --version | head -1
 
-          timeout 900 git clone --depth=60 -b floppy-unity "$FLOP" /tmp/flop >/dev/null 2>&1
-          timeout 900 git clone --depth=1 "$IK" /tmp/ik >/dev/null 2>&1
-          timeout 900 git clone --depth=1 -b statx "$IK" /tmp/ik-statx >/dev/null 2>&1
-          timeout 900 git clone --filter=tree:0 --no-checkout "$IK" /tmp/ik-hist >/dev/null 2>&1
+      - name: Clone repo
+        shell: bash
+        run: |
+          git clone --depth=1 -b "$FLOP_BRANCH" https://github.com/FlopKernel-Series/flop_trinket-mi_kernel.git kernel
+          git clone --depth=1 https://github.com/ikteach/ginkgo_nethunter_kernel.git ik
 
-          echo "# Recon 2" >> "$R"
+      - name: Diagnostik repo Flop
+        shell: bash
+        working-directory: kernel
+        run: |
+          {
+            echo "## Diagnostik Flop"
+            echo '```'
+            ls arch/arm64/configs/*.config
+            echo
+            ls floppy_utils scripts/package | head -40
+            echo
+            head -80 do_build.sh
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-          # ================= FLOP =================
-          echo "## FLOP (floppy-unity)" >> "$R"
+      - name: Susun fragment config
+        shell: bash
+        working-directory: kernel
+        run: |
+          C=arch/arm64/configs
 
-          sec "Isi root repo"
-          x /tmp/flop 'ls -1 | head -70'
-          end
+          case "$VARIANT" in
+            suki)  KSU_FRAG=sukisu.config ;;
+            xxksu) KSU_FRAG=xxksu.config ;;
+            next)
+              KSU_FRAG=$(grep -l 'CONFIG_KSU_NEXT=y' $C/*.config 2>/dev/null | head -1 | xargs -r -n1 basename || true)
+              if [ -z "$KSU_FRAG" ]; then
+                printf 'CONFIG_KSU=y\nCONFIG_KSU_NEXT=y\nCONFIG_KSU_MANUAL_HOOK=y\n' > $C/ksunext-auto.config
+                KSU_FRAG=ksunext-auto.config
+              fi
+              ;;
+          esac
+          FRAGS="$KSU_FRAG"
 
-          sec "Folder KSU di drivers"
-          x /tmp/flop 'ls -d drivers/*ksu* drivers/*suki* drivers/*KernelSU* ; echo ---; ls drivers/kernelsu | head -50'
-          end
+          # SuSFS: tambahkan blok standar kalau fragment KSU belum memuatnya
+          if ! grep -q '^CONFIG_KSU_SUSFS=y' "$C/$KSU_FRAG"; then
+            cat > $C/susfs-add.config <<'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          # CONFIG_KSU_SUSFS_TRY_UMOUNT is not set
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_SUS_MEMFD=y
+          EOF
+            FRAGS="$FRAGS susfs-add.config"
+          fi
 
-          sec "Cara KSU dipasang ke build (Kconfig/Makefile induk)"
-          x /tmp/flop 'grep -n -i -E "ksu|susfs|suki" drivers/Kconfig drivers/Makefile fs/Kconfig fs/Makefile Makefile Kconfig | head -40'
-          end
+          # NetHunter: ambil nilai persis dari nethunter_defconfig milik ikteach (hanya opsi in-tree pilihan)
+          if [ "$NH" = "true" ]; then
+            PAT='NETHUNTER_[A-Z_]+|WLAN_VENDOR_[A-Z0-9_]+|CFG80211_WEXT|LIB80211|MAC80211[A-Z0-9_]*|ATH_COMMON|ATH9K[A-Z0-9_]*|ATH6KL[A-Z0-9_]*|CARL9170[A-Z0-9_]*|MT7601U|MT76_[A-Z0-9_]+|MT76x0U|MT76x2U|MT76x2_COMMON|RT2X00[A-Z0-9_]*|RT2500USB|RT2800USB[A-Z0-9_]*|RT2800_LIB|RT73USB|RTL8187[A-Z0-9_]*|RTL8192CU|RTL8192C_COMMON|RTL8XXXU[A-Z0-9_]*|RTLWIFI|RTLWIFI_USB|RTL_CARDS|ZD1211RW|USB_ZD1201|LIBERTAS|EEPROM_93CX6|CRC_ITU_T|CRYPTO_CCM|BT_[A-Z0-9_]+|CAN|CAN_[A-Z0-9_]+|NET_EMATCH_CANID|SYSVIPC[A-Z_]*|POSIX_MQUEUE[A-Z_]*|USB_ACM|USB_CONFIGFS_(ACM|ECM_SUBSET|EEM|OBEX|RNDIS|SERIAL)|USB_F_(ACM|EEM|OBEX|RNDIS|SERIAL|SUBSET)|USB_U_SERIAL|USB_NET_RNDIS_WLAN|USB_RTL8150|USB_SERIAL[A-Z0-9_]*|USB_MON|MEDIA_SDR_SUPPORT|MEDIA_USB_SUPPORT|MEDIA_TUNER_MSI001|USB_AIRSPY|USB_HACKRF|USB_MSI2500'
+            grep -E "^CONFIG_(${PAT})=(y|m)$" ../ik/$C/nethunter_defconfig > $C/nh-add.config || true
+            echo 'CONFIG_LOCALVERSION="-Floppy-NH"' >> $C/nh-add.config
+            FRAGS="$FRAGS nh-add.config"
+            echo "Opsi NetHunter yang dibawa: $(wc -l < $C/nh-add.config)"
+          fi
 
-          sec "Kconfig tiap varian KSU (maks 120 baris per file)"
-          x /tmp/flop 'for k in drivers/kernelsu/Kconfig drivers/sukisu/Kconfig drivers/xxksu/Kconfig; do [ -f "$k" ] && { echo "--- $k"; head -120 "$k"; }; done'
-          end
+          echo "Fragment dipakai: $FRAGS"
+          echo "FRAGS=$FRAGS" >> "$GITHUB_ENV"
 
-          sec "Isi fragment config (ginkgo + xiaomi-trinket)"
-          x /tmp/flop 'for f in arch/arm64/configs/vendor/ginkgo.config arch/arm64/configs/vendor/xiaomi-trinket.config; do echo "--- $f"; head -80 "$f"; done'
-          end
+      - name: Generate .config
+        shell: bash
+        working-directory: kernel
+        run: |
+          export PATH=/usr/lib/llvm-19/bin:$PATH
+          make $MAKE_ARGS vendor/trinket-perf_defconfig vendor/ginkgo.config vendor/xiaomi-trinket.config $FRAGS
 
-          sec "Semua baris KSU/SUSFS di folder configs"
-          x /tmp/flop 'grep -rn -E "KSU|SUSFS" arch/arm64/configs | head -30'
-          end
+      - name: Cek config akhir
+        shell: bash
+        working-directory: kernel
+        run: |
+          cp out/.config ../final.config
+          {
+            echo "## Config akhir"
+            echo '```'
+            grep -E '^CONFIG_(KSU[A-Z_]*|LOCALVERSION|MAC80211|CFG80211|ATH9K_HTC|RTL8XXXU|RT2800USB|MT76x0U|SYSVIPC|CAN|KPROBES)=' out/.config || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! grep -q '^CONFIG_KSU=y' out/.config; then
+            echo "::error::CONFIG_KSU tidak aktif di .config akhir. Cek nama fragment/Kconfig varian ini."
+            exit 1
+          fi
 
-          sec "Skrip/dokumen build di repo"
-          x /tmp/flop 'ls -1 | grep -i -E "\.sh$|build|readme|\.md$"; echo ---; ls -a .github 2>&1; echo ---; ls scripts | grep -i -E "build|ksu|susfs|pack|strip"'
-          end
+      - name: Build kernel
+        shell: bash
+        working-directory: kernel
+        run: |
+          export PATH=/usr/lib/llvm-19/bin:$PATH
+          make $MAKE_ARGS -j"$(nproc --all)" 2>&1 | tee ../build.log
 
-          sec "Commit 'Adjustments for LKM support' dan commit terbaru"
-          x /tmp/flop 'git show --stat --format="%h %ad %s" --date=short 6904b6d521 | head -30; echo ---; git show --stat --format="%h %ad %s" --date=short f3bf1cf859 | head -15'
-          end
+      - name: Bungkus AnyKernel3
+        shell: bash
+        run: |
+          B=kernel/out/arch/arm64/boot
+          ls -la $B
+          if [ ! -f $B/Image.gz-dtb ]; then
+            echo "::error::Image.gz-dtb tidak ada (kernel ini mungkin pakai dtb terpisah). Lihat daftar file di atas."
+            exit 1
+          fi
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md
+          cp $B/Image.gz-dtb ak3/
+          cat > ak3/anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Ginkgo Flop-base KSU SuSFS NetHunter
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=ginkgo
+          device.name2=willow
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
 
-          sec "Versi KSU Next (Makefile/Kbuild)"
-          x /tmp/flop 'grep -n -i -E "KSU_VERSION|3\.4\.0|legacy" drivers/kernelsu/Makefile drivers/kernelsu/Kbuild 2>/dev/null | head -12'
-          end
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          }
 
-          # ================= IKTEACH =================
-          echo "## IKTEACH" >> "$R"
+          BLOCK=auto;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
 
-          sec "Commit a61fd9453af5 (yang ada di HP) ada di repo?"
-          x /tmp/ik-hist 'git cat-file -t a61fd9453af5; echo "exit=$?"'
-          end
+          . tools/ak3-core.sh;
 
-          sec "Branch statx: versi kernel + commit terakhir"
-          x /tmp/ik-statx 'head -5 Makefile; git log -3 --format="%h %ad | %s" --date=short'
-          end
+          dump_boot;
 
-          sec "Daftar defconfig (root + vendor)"
-          x /tmp/ik 'ls -1 arch/arm64/configs | head -60; echo ---; ls -1 arch/arm64/configs/vendor | head -40'
-          end
+          write_boot;
+          EOF
+          TAG=$([ "$NH" = "true" ] && echo NH || echo noNH)
+          ZIP="Ginkgo-Flop-${VARIANT}-${TAG}-$(date +%Y%m%d-%H%M).zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x '.git*' '*placeholder')
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          ls -la "$ZIP"
 
-          sec "Driver wireless di drivers/net/wireless"
-          x /tmp/ik 'ls -1 drivers/net/wireless | head -60'
-          end
-
-          # ============ SELISIH NETHUNTER vs FLOP ============
-          echo "## SELISIH FITUR (ikteach nethunter_defconfig vs Flop trinket-perf_defconfig)" >> "$R"
-
-          A=/tmp/ik/arch/arm64/configs/nethunter_defconfig
-          B=/tmp/flop/arch/arm64/configs/vendor/trinket-perf_defconfig
-          grep -E '^CONFIG_[A-Za-z0-9_]+=(y|m)' "$A" | sed 's/=.*//' | sort -u > /tmp/a.txt
-          grep -E '^CONFIG_[A-Za-z0-9_]+=(y|m)' "$B" | sed 's/=.*//' | sort -u > /tmp/b.txt
-          comm -23 /tmp/a.txt /tmp/b.txt > "$PWD/nethunter-extra.txt"
-
-          sec "Jumlah opsi yang aktif di ikteach tapi tidak aktif di Flop"
-          wc -l < "$PWD/nethunter-extra.txt" >> "$R"
-          end
-
-          sec "Yang relevan NetHunter (disaring, maks 150)"
-          grep -i -E 'WIRELESS|80211|CFG80211|RTL|ATH|RT2|RT28|ZD12|MT7|HID|RNDIS|CH341|PL2303|FTDI|USB_SERIAL|BT_|BLUETOOTH|CAN|DVB|RADIO|SYSVIPC|FHANDLE|DEVTMPFS|CGROUP|NAMESPACES|USB_NET|USB_GADGET|CONFIGFS|_F_' "$PWD/nethunter-extra.txt" | head -150 >> "$R"
-          end
-
-          cat "$R"
-          cat "$R" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload laporan
+      - name: Upload zip kernel
         uses: actions/upload-artifact@v4
         with:
-          name: recon2
+          name: kernel-zip
+          path: ${{ env.ZIP }}
+
+      - name: Upload log dan config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-config
           path: |
-            report2.md
-            nethunter-extra.txt
-            
+            build.log
+            final.config
+          if-no-files-found: ignore
+          
