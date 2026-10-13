@@ -1,189 +1,282 @@
-name: Build Ginkgo - FlopKernel + KernelSU-Next + SuSFS
+name: Build Ginkgo (Flop + KSU + SuSFS + NetHunter)
 
-# Install as .github/workflows/build-ginkgo.yml in your build repository.
-# This workflow uses the source repository's own build driver instead of
-# inventing Kconfig fragments or rewriting kernel symbols.
+# Taruh di: .github/workflows/build-ginkgo.yml
+# Jalankan: Actions -> "Build Ginkgo" -> Run workflow
+# Hasil: artifact berisi zip AnyKernel3 + build.log + final.config + nethunter-modules.zip
 
 on:
   workflow_dispatch:
     inputs:
-      flop_ref:
-        description: "Branch, tag, or commit in FlopKernel source"
-        required: true
-        type: string
-        default: "floppy-unity"
-      clean_build:
-        description: "Clean generated output before building"
-        required: true
+      ksu_variant:
+        description: "Varian KSU: suki (ReSukiSU) / next (KernelSU Next legacy) / xxksu"
+        type: choice
+        options:
+          - suki
+          - next
+          - xxksu
+        default: suki
+      nethunter:
+        description: "Tambah config NetHunter in-tree (WiFi USB, BT, CAN, HID gadget, SYSVIPC)"
         type: boolean
         default: true
-
-permissions:
-  contents: read
-
-concurrency:
-  group: build-ginkgo-${{ github.ref }}
-  cancel-in-progress: false
+      flop_branch:
+        description: "Branch repo Flop"
+        type: string
+        default: floppy-unity
 
 jobs:
   build:
-    name: Build ginkgo (KernelSU + source-provided SuSFS)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 240
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
     env:
-      FLOP_REPO: https://github.com/FlopKernel-Series/flop_trinket-mi_kernel.git
-      FLOP_REF: ${{ inputs.flop_ref }}
-      CLEAN_BUILD: ${{ inputs.clean_build }}
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 5G
-      ARCH: arm64
-
+      VARIANT: ${{ inputs.ksu_variant }}
+      NH: ${{ inputs.nethunter }}
+      FLOP_BRANCH: ${{ inputs.flop_branch }}
+      # Tambahan LLVM_IAS=1 untuk mempercepat proses kompilasi assembler bawaan LLVM
+      MAKE_ARGS: "O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- KCFLAGS=-Wno-error"
     steps:
-      - name: Install host dependencies
+      - name: Install dependensi
         shell: bash
         run: |
-          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git libelf-dev \
-            libssl-dev lld llvm clang gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi make pahole perl python3 rsync unzip zip \
-            wget xz-utils zstd device-tree-compiler gnupg software-properties-common
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip unzip lz4 xz-utils python3 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi ccache git curl wget lsb-release gnupg software-properties-common
 
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ginkgo-ccache-${{ runner.os }}-${{ inputs.flop_ref }}-${{ github.run_id }}
-          restore-keys: |
-            ginkgo-ccache-${{ runner.os }}-${{ inputs.flop_ref }}-
-            ginkgo-ccache-${{ runner.os }}-
-
-      - name: Clone FlopKernel source
+      - name: Install clang 19
         shell: bash
         run: |
-          set -euxo pipefail
-          git clone --filter=blob:none "$FLOP_REPO" kernel
-          git -C kernel fetch --depth=1 origin "$FLOP_REF"
-          git -C kernel checkout --detach FETCH_HEAD
-          echo "SOURCE_SHA=$(git -C kernel rev-parse HEAD)" >> "$GITHUB_ENV"
-          git -C kernel log -1 --format='%H%n%cs%n%s' | tee source-revision.txt
-          test -f kernel/do_build.sh || { echo 'do_build.sh tidak ditemukan'; exit 1; }
-          test -f kernel/build/ckbuild.sh || { echo 'build/ckbuild.sh tidak ditemukan'; exit 1; }
-          test -f kernel/build/scripts/build.sh || { echo 'build/scripts/build.sh tidak ditemukan'; exit 1; }
-          test -f kernel/build/scripts/tc.sh || { echo 'build/scripts/tc.sh tidak ditemukan'; exit 1; }
+          wget -q https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 19
+          sudo apt-get install -y llvm-19 lld-19
+          /usr/lib/llvm-19/bin/clang --version | head -1
 
-      - name: Check source integration and build entrypoints
+      - name: Restore cache ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          # Perbaikan logika cache: Gunakan prefix statis agar cache antar-build saling membaca
+          key: ccache-ginkgo-${{ github.run_id }}
+          restore-keys: |
+            ccache-ginkgo-
+
+      - name: Siapkan ccache
+        shell: bash
+        run: |
+          mkdir -p /tmp/cc
+          ln -sf "$(which ccache)" /tmp/cc/clang
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=3G" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          ccache -z || true
+
+      - name: Clone repo
+        shell: bash
+        run: |
+          git clone --depth=1 -b "$FLOP_BRANCH" https://github.com/FlopKernel-Series/flop_trinket-mi_kernel.git kernel
+          git clone --depth=1 https://github.com/ikteach/ginkgo_nethunter_kernel.git ik
+
+      - name: Diagnostik repo Flop
         shell: bash
         working-directory: kernel
         run: |
-          set -euo pipefail
           {
-            echo '## Source revision'
+            echo "## Diagnostik Flop"
             echo '```'
-            git log -1 --format='%H%n%cs%n%s'
-            echo '```'
-            echo '## KernelSU / SuSFS source markers'
-            echo '```'
-            git grep -n -i -E 'KernelSU.?Next|SUSFS|CONFIG_KSU_SUSFS|susfs' -- \
-              'Kconfig*' 'arch/arm64/configs/**' 'drivers/**' 'fs/**' \
-              'floppy_utils/**' 'build/**' 'ksu.config' 'do_build.sh' 2>/dev/null | head -160 || true
+            ls arch/arm64/configs/*.config
+            echo
+            ls floppy_utils scripts/package | head -40
+            echo
+            head -80 do_build.sh
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          # The source's own driver is the authority for its Kconfig, toolchain,
-          # patches, and output paths. Do not synthesize CONFIG_KSU_NEXT or
-          # SUSFS symbols: those names vary between kernel forks.
-          grep -q 'ck_script="build/ckbuild.sh"' do_build.sh
 
-      - name: Configure build environment
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p "$CCACHE_DIR"
-          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
-          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE/kernel" >> "$GITHUB_ENV"
-          ccache --set-config=max_size="$CCACHE_MAXSIZE"
-          ccache --zero-stats || true
-          # The source build driver downloads/selects its own toolchain in build/scripts/tc.sh.
-          # Do not force a separate host LLVM version over that selection.
-
-      - name: Build ginkgo with source build driver
+      - name: Susun fragment config
         shell: bash
         working-directory: kernel
         run: |
-          set -o pipefail
-          # In this source, 'k' selects the KernelSU-Next-SuSFS build; 'c' requests clean.
-          # Disable source script's optional external log upload to protect build logs.
-          sed -i 's/^LOG_UPLOAD=1$/LOG_UPLOAD=0/' build/ckbuild.sh
-          sed -i "s#curl -F'file=@log.txt' http://0x0.st#echo 'External log upload disabled' #g" build/scripts/post.sh
-          # Its driver expects these optional secret files to exist even for local builds.
-          : > ../chat_test
-          : > ../bot_token
-          if [[ "$CLEAN_BUILD" == "true" ]]; then
-            BUILD_ARGS="kc"
-          else
-            BUILD_ARGS="k"
-          fi
-          bash ./do_build.sh ginkgo "$BUILD_ARGS" 2>&1 | tee ../build.log
+          C=arch/arm64/configs
 
-      - name: Verify final config and locate outputs
+          case "$VARIANT" in
+            suki)  KSU_FRAG=sukisu.config ;;
+            xxksu) KSU_FRAG=xxksu.config ;;
+            next)
+              KSU_FRAG=$(grep -l 'CONFIG_KSU_NEXT=y' $C/*.config 2>/dev/null | head -1 | xargs -r -n1 basename || true)
+              if [ -z "$KSU_FRAG" ]; then
+                printf 'CONFIG_KSU=y\nCONFIG_KSU_NEXT=y\nCONFIG_KSU_MANUAL_HOOK=y\n' > $C/ksunext-auto.config
+                KSU_FRAG=ksunext-auto.config
+              fi
+              ;;
+          esac
+          FRAGS="$KSU_FRAG"
+
+          if ! grep -q '^CONFIG_KSU_SUSFS=y' "$C/$KSU_FRAG"; then
+            cat > $C/susfs-add.config <<'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_SUS_MEMFD=y
+          EOF
+            FRAGS="$FRAGS susfs-add.config"
+          fi
+
+          if [ "$NH" = "true" ]; then
+            PAT='NETHUNTER_[A-Z_]+|WLAN_VENDOR_[A-Z0-9_]+|CFG80211_WEXT|LIB80211|MAC80211[A-Z0-9_]*|ATH_COMMON|ATH9K[A-Z0-9_]*|ATH6KL[A-Z0-9_]*|CARL9170[A-Z0-9_]*|MT7601U|MT76_[A-Z0-9_]+|MT76x0U|MT76x2U|MT76x2_COMMON|RT2X00[A-Z0-9_]*|RT2500USB|RT2800USB[A-Z0-9_]*|RT2800_LIB|RT73USB|RTL8187[A-Z0-9_]*|RTL8192CU|RTL8192C_COMMON|RTL8XXXU[A-Z0-9_]*|RTLWIFI|RTLWIFI_USB|RTL_CARDS|ZD1211RW|USB_ZD1201|LIBERTAS|EEPROM_93CX6|CRC_ITU_T|CRYPTO_CCM|BT_[A-Z0-9_]+|CAN|CAN_[A-Z0-9_]+|NET_EMATCH_CANID|SYSVIPC[A-Z_]*|POSIX_MQUEUE[A-Z_]*|USB_ACM|USB_CONFIGFS_(ACM|ECM_SUBSET|EEM|OBEX|RNDIS|SERIAL)|USB_F_(ACM|EEM|OBEX|RNDIS|SERIAL|SUBSET)|USB_U_SERIAL|USB_NET_RNDIS_WLAN|USB_RTL8150|USB_SERIAL[A-Z0-9_]*|USB_MON|MEDIA_SDR_SUPPORT|MEDIA_USB_SUPPORT|MEDIA_TUNER_MSI001|USB_AIRSPY|USB_HACKRF|USB_MSI2500'
+            grep -E "^CONFIG_(${PAT})=(y|m)$" ../ik/$C/nethunter_defconfig > $C/nh-add.config || true
+            echo 'CONFIG_LOCALVERSION="-Floppy-NH"' >> $C/nh-add.config
+            FRAGS="$FRAGS nh-add.config"
+            echo "Opsi NetHunter yang dibawa: $(wc -l < $C/nh-add.config)"
+          fi
+
+          echo "Fragment dipakai: $FRAGS"
+          echo "FRAGS=$FRAGS" >> "$GITHUB_ENV"
+
+      - name: Generate .config
+        shell: bash
+        working-directory: kernel
+        run: |
+          export PATH=/tmp/cc:/usr/lib/llvm-19/bin:$PATH
+          make $MAKE_ARGS vendor/trinket-perf_defconfig vendor/ginkgo.config vendor/xiaomi-trinket.config $FRAGS
+          # Validasi ulang defconfig agar symlink dan dependencies config tersusun rapi
+          make $MAKE_ARGS olddefconfig
+
+      - name: Cek config akhir
+        shell: bash
+        working-directory: kernel
+        run: |
+          cp out/.config ../final.config
+          {
+            echo "## Config akhir"
+            echo '```'
+            grep -E '^CONFIG_(KSU[A-Z_]*|LOCALVERSION|MAC80211|CFG80211|ATH9K_HTC|RTL8XXXU|RT2800USB|MT76x0U|SYSVIPC|CAN|KPROBES)=' out/.config || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! grep -q '^CONFIG_KSU=y' out/.config; then
+            echo "::error::CONFIG_KSU tidak aktif di .config akhir. Cek nama fragment/Kconfig varian ini."
+            exit 1
+          fi
+
+      - name: Fix konflik simbol ath9k_htc vs qcacld
+        if: ${{ inputs.nethunter }}
+        shell: bash
+        working-directory: kernel
+        run: |
+          D=drivers/net/wireless/ath/ath9k
+          grep -rlE '\bhtc_(start|stop|connect_service)\b' $D | xargs -r sed -i -E 's/\bhtc_(start|stop|connect_service)\b/htc_\1_ath9k/g'
+          echo "Hasil rename di ath9k:"
+          grep -rnE 'htc_(start|stop|connect_service)_ath9k' $D | head -20
+
+      - name: Build kernel & modules
+        shell: bash
+        working-directory: kernel
+        run: |
+          export PATH=/tmp/cc:/usr/lib/llvm-19/bin:$PATH
+          # Tambahan target 'modules' agar driver eksternal NetHunter ikut tercetak
+          make $MAKE_ARGS -j"$(nproc --all)" 2>&1 | tee ../build.log
+          make $MAKE_ARGS modules -j"$(nproc --all)" >> ../build.log 2>&1 || true
+
+      - name: Kumpulkan Loadable Modules (.ko)
+        if: ${{ inputs.nethunter }}
+        shell: bash
+        run: |
+          mkdir -p nethunter_modules
+          find kernel/out -name "*.ko" -type f -exec cp {} nethunter_modules/ \;
+          cd nethunter_modules
+          zip -r9 ../NetHunter-Modules-Ginkgo.zip .
+          echo "Modul kernel berhasil dibungkus."
+
+      - name: Statistik ccache
         if: always()
         shell: bash
-        run: |
-          set +e
-          {
-            echo '## Build verification'
-            echo '```'
-            echo "source_sha=${SOURCE_SHA:-unknown}"
-            find kernel -type f \( -name '.config' -o -name 'Image.gz-dtb' -o -name 'Image.gz' -o -name 'Image' -o -name '*.zip' \) \
-              -not -path '*/.git/*' -printf '%p (%s bytes)\n' | head -250
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+        run: ccache -s || true
 
-          CONFIG=kernel/out/.config
-          [[ -f "$CONFIG" ]] || CONFIG=$(find kernel -type f -path '*/.config' -not -path '*/.git/*' -print -quit)
-          if [[ -n "$CONFIG" ]]; then
-            cp "$CONFIG" final.config
-            grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_SUSFS_[A-Z0-9_]+)=' "$CONFIG" > ksu-susfs.config-summary || true
-            cat ksu-susfs.config-summary || true
-            if ! grep -q '^CONFIG_KSU=y$' "$CONFIG"; then
-              echo '::error::Final config does not show CONFIG_KSU=y; do not flash this build.'
+      - name: Bungkus AnyKernel3
+        shell: bash
+        run: |
+          B=kernel/out/arch/arm64/boot
+          ls -la $B
+          if [ ! -f $B/Image.gz-dtb ]; then
+            if [ -f $B/Image.gz ]; then
+              echo "Image.gz-dtb tidak ditemukan, menggunakan fallback Image.gz"
+              TARGET_IMAGE=$B/Image.gz
+            else
+              echo "::error::Image.gz tidak ada. Kernel gagal di-build."
               exit 1
             fi
-            if ! grep -Eiq '^(CONFIG_.*SUSFS.*=y|CONFIG_KSU_SUSFS=y)' "$CONFIG"; then
-              echo '::warning::No enabled SUSFS-related CONFIG symbol found. Inspect source patches and build log; SuSFS integration is not verified.'
-            fi
           else
-            echo '::warning::No .config found to verify; inspect build.log before using any output.'
+            TARGET_IMAGE=$B/Image.gz-dtb
           fi
-          exit 0
+          
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md
+          cp $TARGET_IMAGE ak3/
+          
+          cat > ak3/anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Ginkgo Flop-base KSU SuSFS NetHunter
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=ginkgo
+          device.name2=willow
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
 
-      - name: Collect build outputs
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          cp -f build.log source-revision.txt artifacts/ 2>/dev/null || true
-          cp -f final.config ksu-susfs.config-summary artifacts/ 2>/dev/null || true
-          # Preserve source-generated flashable packages if the source driver made any.
-          find kernel -type f -name '*.zip' -not -path '*/.git/*' -exec cp -n {} artifacts/ \; 2>/dev/null || true
-          # Keep kernel images for diagnostics, but do not call them flashable ZIPs.
-          find kernel -type f \( -name 'Image.gz-dtb' -o -name 'Image.gz' -o -name 'Image' -o -name '*.dtb' -o -name '*.dtbo' \) \
-            -not -path '*/.git/*' -exec cp -n --parents {} artifacts/ \; 2>/dev/null || true
-          test -n "$(find artifacts -type f -print -quit)"
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          }
 
-      - name: Upload build artifacts and diagnostics
+          # Perbaikan Block Partition khusus Ginkgo
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          EOF
+          
+          TAG=$([ "$NH" = "true" ] && echo NH || echo noNH)
+          ZIP="Ginkgo-Flop-${VARIANT}-${TAG}-$(date +%Y%m%d-%H%M).zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x '.git*' '*placeholder')
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Upload zip kernel & Modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-zip
+          path: |
+            ${{ env.ZIP }}
+            NetHunter-Modules-Ginkgo.zip
+
+      - name: Upload log dan config
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ginkgo-ksunext-susfs-${{ github.run_number }}
-          path: artifacts/
-          if-no-files-found: warn
-          retention-days: 14
+          name: log-config
+          path: |
+            build.log
+            final.config
+          if-no-files-found: ignore
 
-      - name: ccache statistics
+      - name: Simpan cache ccache
         if: always()
-        shell: bash
-        run: ccache --show-stats || true
-        
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ginkgo-${{ github.run_id }}
+          
