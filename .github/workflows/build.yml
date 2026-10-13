@@ -1,44 +1,278 @@
-      - name: Buat Modul KernelSU/Magisk untuk Loadable Modules (.ko)
-        if: ${{ inputs.nethunter }}
+name: Build Ginkgo (Flop + KSU + SuSFS + NetHunter)
+
+# Taruh di: .github/workflows/build-ginkgo.yml
+# Jalankan: Actions -> "Build Ginkgo" -> Run workflow
+# Hasil: artifact berisi zip AnyKernel3 + build.log + final.config
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: "Varian KSU: next (KernelSU Next legacy) / suki (ReSukiSU) / xxksu"
+        type: choice
+        options:
+          - next
+          - suki
+          - xxksu
+        default: next
+      nethunter:
+        description: "Tambah config NetHunter in-tree (WiFi USB, BT, CAN, HID gadget, SYSVIPC)"
+        type: boolean
+        default: true
+      flop_branch:
+        description: "Branch repo Flop"
+        type: string
+        default: floppy-unity
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      VARIANT: ${{ inputs.ksu_variant }}
+      NH: ${{ inputs.nethunter }}
+      FLOP_BRANCH: ${{ inputs.flop_branch }}
+      MAKE_ARGS: "O=out ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- KCFLAGS=-Wno-error"
+    steps:
+      - name: Install dependensi
         shell: bash
         run: |
-          # 1. Buat struktur folder standar modul Magisk/KSU
-          mkdir -p nethunter_ksu_module/system/vendor/lib/modules
-          
-          # 2. Pindahkan semua .ko hasil compile ke folder modul
-          find kernel/out -name "*.ko" -type f -exec cp {} nethunter_ksu_module/system/vendor/lib/modules/ \;
-          
-          # 3. Buat metadata modul (module.prop)
-          cat > nethunter_ksu_module/module.prop <<'EOF'
-          id=nethunter-ginkgo-modules
-          name=NetHunter WiFi/BT Modules (Ginkgo)
-          version=v1.0
-          versionCode=1
-          author=Flop Kernel Actions
-          description=Systemless kernel modules (.ko) auto-installer & loader untuk perangkat NetHunter (WiFi eksternal, Bluetooth, dll).
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip unzip lz4 xz-utils python3 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi ccache git curl wget lsb-release gnupg software-properties-common
+
+      - name: Install clang 19
+        shell: bash
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          sudo apt-get install -y llvm-19 lld-19
+          /usr/lib/llvm-19/bin/clang --version | head -1
+
+      - name: Restore cache ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: |
+            ccache-
+
+      - name: Siapkan ccache
+        shell: bash
+        run: |
+          mkdir -p /tmp/cc
+          ln -sf "$(which ccache)" /tmp/cc/clang
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=3G" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          ccache -z || true
+
+      - name: Clone repo
+        shell: bash
+        run: |
+          git clone --depth=1 -b "$FLOP_BRANCH" https://github.com/FlopKernel-Series/flop_trinket-mi_kernel.git kernel
+          git clone --depth=1 https://github.com/ikteach/ginkgo_nethunter_kernel.git ik
+
+      - name: Diagnostik repo Flop
+        shell: bash
+        working-directory: kernel
+        run: |
+          {
+            echo "## Diagnostik Flop"
+            echo '```'
+            ls arch/arm64/configs/*.config
+            echo
+            echo "Simbol Kconfig KSU yang tersedia:"
+            grep -rhE '^config KSU' drivers/kernelsu drivers/sukisu drivers/xxksu 2>/dev/null | sort -u | head -60
+            echo
+            ls floppy_utils scripts/package | head -40
+            echo
+            head -80 do_build.sh
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Susun fragment config
+        shell: bash
+        working-directory: kernel
+        run: |
+          C=arch/arm64/configs
+
+          case "$VARIANT" in
+            suki)  KSU_FRAG=sukisu.config ;;
+            xxksu) KSU_FRAG=xxksu.config ;;
+            next)
+              # pakai fragment bawaan Flop kalau ada (bukan milik suki/xxksu), kalau tidak bikin sendiri
+              KSU_FRAG=$(grep -l 'CONFIG_KSU_NEXT=y' $C/*.config 2>/dev/null | grep -v -E 'suki|xxksu' | head -1 | xargs -r -n1 basename || true)
+              if [ -z "$KSU_FRAG" ]; then
+                {
+                  echo 'CONFIG_KSU=y'
+                  echo 'CONFIG_KSU_NEXT=y'
+                  echo 'CONFIG_KSU_MANUAL_HOOK=y'
+                  echo '# CONFIG_KSU_SUKI is not set'
+                  echo '# CONFIG_KSU_RKSU is not set'
+                  echo '# CONFIG_KSU_XXKSU is not set'
+                  echo '# CONFIG_KSU_DEBUG is not set'
+                } > $C/ksunext-auto.config
+                KSU_FRAG=ksunext-auto.config
+              fi
+              ;;
+          esac
+          FRAGS="$KSU_FRAG"
+
+          # SuSFS: tambahkan blok standar kalau fragment KSU belum memuatnya
+          if ! grep -q '^CONFIG_KSU_SUSFS=y' "$C/$KSU_FRAG"; then
+            cat > $C/susfs-add.config <<'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          # CONFIG_KSU_SUSFS_TRY_UMOUNT is not set
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_SUS_MEMFD=y
           EOF
-          
-          # 4. Buat script service.sh untuk auto-load driver saat HP nyala
-          cat > nethunter_ksu_module/service.sh <<'EOF'
-          #!/system/bin/sh
-          MODDIR=${0%/*}
-          
-          # Tunggu sistem selesai booting agar tidak membebani proses startup
-          until [ "$(getprop sys.boot_completed)" = "1" ]; do
-              sleep 2
-          done
-          
-          # Eksekusi insmod untuk setiap file driver .ko yang ada
-          for ko_file in $(find $MODDIR/system/vendor/lib/modules -name "*.ko"); do
-              insmod "$ko_file"
-          done
+            FRAGS="$FRAGS susfs-add.config"
+          fi
+
+          # NetHunter: ambil nilai persis dari nethunter_defconfig milik ikteach (hanya opsi in-tree pilihan)
+          if [ "$NH" = "true" ]; then
+            PAT='NETHUNTER_[A-Z_]+|WLAN_VENDOR_[A-Z0-9_]+|CFG80211_WEXT|LIB80211|MAC80211[A-Z0-9_]*|ATH_COMMON|ATH9K[A-Z0-9_]*|ATH6KL[A-Z0-9_]*|CARL9170[A-Z0-9_]*|MT7601U|MT76_[A-Z0-9_]+|MT76x0U|MT76x2U|MT76x2_COMMON|RT2X00[A-Z0-9_]*|RT2500USB|RT2800USB[A-Z0-9_]*|RT2800_LIB|RT73USB|RTL8187[A-Z0-9_]*|RTL8192CU|RTL8192C_COMMON|RTL8XXXU[A-Z0-9_]*|RTLWIFI|RTLWIFI_USB|RTL_CARDS|ZD1211RW|USB_ZD1201|LIBERTAS|EEPROM_93CX6|CRC_ITU_T|CRYPTO_CCM|BT_[A-Z0-9_]+|CAN|CAN_[A-Z0-9_]+|NET_EMATCH_CANID|SYSVIPC[A-Z_]*|POSIX_MQUEUE[A-Z_]*|USB_ACM|USB_CONFIGFS_(ACM|ECM_SUBSET|EEM|OBEX|RNDIS|SERIAL)|USB_F_(ACM|EEM|OBEX|RNDIS|SERIAL|SUBSET)|USB_U_SERIAL|USB_NET_RNDIS_WLAN|USB_RTL8150|USB_SERIAL[A-Z0-9_]*|USB_MON|MEDIA_SDR_SUPPORT|MEDIA_USB_SUPPORT|MEDIA_TUNER_MSI001|USB_AIRSPY|USB_HACKRF|USB_MSI2500'
+            grep -E "^CONFIG_(${PAT})=(y|m)$" ../ik/$C/nethunter_defconfig > $C/nh-add.config || true
+            echo 'CONFIG_LOCALVERSION="-Floppy-NH"' >> $C/nh-add.config
+            FRAGS="$FRAGS nh-add.config"
+            echo "Opsi NetHunter yang dibawa: $(wc -l < $C/nh-add.config)"
+          fi
+
+          echo "Fragment dipakai: $FRAGS"
+          echo "FRAGS=$FRAGS" >> "$GITHUB_ENV"
+
+      - name: Generate .config
+        shell: bash
+        working-directory: kernel
+        run: |
+          export PATH=/tmp/cc:/usr/lib/llvm-19/bin:$PATH
+          make $MAKE_ARGS vendor/trinket-perf_defconfig vendor/ginkgo.config vendor/xiaomi-trinket.config $FRAGS
+
+      - name: Cek config akhir
+        shell: bash
+        working-directory: kernel
+        run: |
+          cp out/.config ../final.config
+          {
+            echo "## Config akhir"
+            echo '```'
+            grep -E '^CONFIG_(KSU[A-Z_]*|LOCALVERSION|MAC80211|CFG80211|ATH9K_HTC|RTL8XXXU|RT2800USB|MT76x0U|SYSVIPC|CAN|KPROBES)=' out/.config || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! grep -q '^CONFIG_KSU=y' out/.config; then
+            echo "::error::CONFIG_KSU tidak aktif di .config akhir. Cek nama fragment/Kconfig varian ini."
+            exit 1
+          fi
+          if [ "$VARIANT" = "next" ] && ! grep -q '^CONFIG_KSU_NEXT=y' out/.config; then
+            echo "::error::Varian next dipilih tapi CONFIG_KSU_NEXT tidak aktif. Lihat daftar simbol Kconfig di langkah Diagnostik."
+            exit 1
+          fi
+
+      - name: Fix konflik simbol ath9k_htc vs qcacld
+        if: ${{ inputs.nethunter }}
+        shell: bash
+        working-directory: kernel
+        run: |
+          # ath9k_htc dan qcacld (WiFi bawaan) sama-sama punya htc_start, htc_stop, htc_connect_service.
+          # Ganti nama versi ath9k supaya tidak bentrok saat link built-in.
+          D=drivers/net/wireless/ath/ath9k
+          grep -rlE '\bhtc_(start|stop|connect_service)\b' $D | xargs -r sed -i -E 's/\bhtc_(start|stop|connect_service)\b/htc_\1_ath9k/g'
+          echo "Hasil rename di ath9k:"
+          grep -rnE 'htc_(start|stop|connect_service)_ath9k' $D | head -20
+
+      - name: Build kernel
+        shell: bash
+        working-directory: kernel
+        run: |
+          export PATH=/tmp/cc:/usr/lib/llvm-19/bin:$PATH
+          make $MAKE_ARGS -j"$(nproc --all)" 2>&1 | tee ../build.log
+
+      - name: Statistik ccache
+        if: always()
+        shell: bash
+        run: ccache -s || true
+
+      - name: Bungkus AnyKernel3
+        shell: bash
+        run: |
+          B=kernel/out/arch/arm64/boot
+          ls -la $B
+          if [ ! -f $B/Image.gz-dtb ]; then
+            echo "::error::Image.gz-dtb tidak ada (kernel ini mungkin pakai dtb terpisah). Lihat daftar file di atas."
+            exit 1
+          fi
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md
+          cp $B/Image.gz-dtb ak3/
+          cat > ak3/anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Ginkgo Flop-base KSU SuSFS NetHunter
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=ginkgo
+          device.name2=willow
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          }
+
+          BLOCK=auto;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+
+          write_boot;
           EOF
-          
-          # 5. Beri izin eksekusi pada script
-          chmod +x nethunter_ksu_module/service.sh
-          
-          # 6. Bungkus menjadi file ZIP siap flash
-          cd nethunter_ksu_module
-          zip -r9 ../NetHunter-KSU-Magisk-Module.zip .
-          echo "Modul KSU/Magisk berhasil dibuat!"
+          TAG=$([ "$NH" = "true" ] && echo NH || echo noNH)
+          ZIP="Ginkgo-Flop-${VARIANT}-${TAG}-$(date +%Y%m%d-%H%M).zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x '.git*' '*placeholder')
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          ls -la "$ZIP"
+
+      - name: Upload zip kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-zip
+          path: ${{ env.ZIP }}
+
+      - name: Upload log dan config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-config
+          path: |
+            build.log
+            final.config
+          if-no-files-found: ignore
+
+      - name: Simpan cache ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.run_id }}
           
