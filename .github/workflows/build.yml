@@ -107,7 +107,7 @@ jobs:
               fi
               ;;
           esac
-          FRAGS="$KSU_FRAG"
+          FRAGS="$C/$KSU_FRAG"
 
           # SuSFS: tambahkan blok standar kalau fragment KSU belum memuatnya
           if ! grep -q '^CONFIG_KSU_SUSFS=y' "$C/$KSU_FRAG"; then
@@ -125,7 +125,7 @@ jobs:
           CONFIG_KSU_SUSFS_SUS_MAP=y
           CONFIG_KSU_SUSFS_SUS_MEMFD=y
           EOF
-            FRAGS="$FRAGS susfs-add.config"
+            FRAGS="$FRAGS $C/susfs-add.config"
           fi
 
           # NetHunter: ambil nilai persis dari nethunter_defconfig milik ikteach (hanya opsi in-tree pilihan)
@@ -133,11 +133,18 @@ jobs:
             PAT='NETHUNTER_[A-Z_]+|WLAN_VENDOR_[A-Z0-9_]+|CFG80211_WEXT|LIB80211|MAC80211[A-Z0-9_]*|ATH_COMMON|ATH9K[A-Z0-9_]*|ATH6KL[A-Z0-9_]*|CARL9170[A-Z0-9_]*|MT7601U|MT76_[A-Z0-9_]+|MT76x0U|MT76x2U|MT76x2_COMMON|RT2X00[A-Z0-9_]*|RT2500USB|RT2800USB[A-Z0-9_]*|RT2800_LIB|RT73USB|RTL8187[A-Z0-9_]*|RTL8192CU|RTL8192C_COMMON|RTL8XXXU[A-Z0-9_]*|RTLWIFI|RTLWIFI_USB|RTL_CARDS|ZD1211RW|USB_ZD1201|LIBERTAS|EEPROM_93CX6|CRC_ITU_T|CRYPTO_CCM|BT_[A-Z0-9_]+|CAN|CAN_[A-Z0-9_]+|NET_EMATCH_CANID|SYSVIPC[A-Z_]*|POSIX_MQUEUE[A-Z_]*|USB_ACM|USB_CONFIGFS_(ACM|ECM_SUBSET|EEM|OBEX|RNDIS|SERIAL)|USB_F_(ACM|EEM|OBEX|RNDIS|SERIAL|SUBSET)|USB_U_SERIAL|USB_NET_RNDIS_WLAN|USB_RTL8150|USB_SERIAL[A-Z0-9_]*|USB_MON|MEDIA_SDR_SUPPORT|MEDIA_USB_SUPPORT|MEDIA_TUNER_MSI001|USB_AIRSPY|USB_HACKRF|USB_MSI2500'
             grep -E "^CONFIG_(${PAT})=(y|m)$" ../ik/$C/nethunter_defconfig > $C/nh-add.config || true
             echo 'CONFIG_LOCALVERSION="-Floppy-NH"' >> $C/nh-add.config
-            FRAGS="$FRAGS nh-add.config"
+            FRAGS="$FRAGS $C/nh-add.config"
             echo "Opsi NetHunter yang dibawa: $(wc -l < $C/nh-add.config)"
           fi
 
           echo "Fragment dipakai: $FRAGS"
+          # Pastikan semua fragment benar-benar ada sebelum masuk tahap merge.
+          for f in $FRAGS; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Fragment config tidak ditemukan: $f"
+              exit 1
+            fi
+          done
           echo "FRAGS=$FRAGS" >> "$GITHUB_ENV"
 
       - name: Generate .config
@@ -145,7 +152,15 @@ jobs:
         working-directory: kernel
         run: |
           export PATH=/tmp/cc:/usr/lib/llvm-19/bin:$PATH
-          make $MAKE_ARGS vendor/trinket-perf_defconfig vendor/ginkgo.config vendor/xiaomi-trinket.config $FRAGS
+          # Buat konfigurasi dasar terlebih dahulu. File *.config tambahan adalah
+          # fragment, bukan target make; gabungkan dengan merge_config.sh.
+          make $MAKE_ARGS vendor/trinket-perf_defconfig
+          scripts/kconfig/merge_config.sh -m -O out out/.config \
+            vendor/ginkgo.config \
+            vendor/xiaomi-trinket.config \
+            $FRAGS
+          make $MAKE_ARGS olddefconfig
+          cp out/.config ../merged.config
 
       - name: Cek config akhir
         shell: bash
@@ -159,9 +174,35 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
           if ! grep -q '^CONFIG_KSU=y' out/.config; then
-            echo "::error::CONFIG_KSU tidak aktif di .config akhir. Cek nama fragment/Kconfig varian ini."
+            echo "::error::CONFIG_KSU tidak aktif di .config akhir. Cek fragment dan definisi Kconfig."
             exit 1
           fi
+
+          case "$VARIANT" in
+            next)
+              if ! grep -q '^CONFIG_KSU_NEXT=y' out/.config; then
+                echo "::error::Varian next dipilih, tetapi CONFIG_KSU_NEXT tidak aktif setelah olddefconfig."
+                exit 1
+              fi
+              ;;
+            suki)
+              if ! grep -Eq '^CONFIG_KSU_SUKISU=y|^CONFIG_KSU_SUKI=y|^CONFIG_KSU=y' out/.config; then
+                echo "::warning::Tidak ditemukan simbol konfigurasi khusus SukiSU; periksa apakah driver SukiSU memang tersedia di source."
+              fi
+              ;;
+            xxksu)
+              echo "::notice::Pastikan fragment xxksu.config sesuai dengan implementasi driver yang ada di source."
+              ;;
+          esac
+
+          # CONFIG_KSU_* hanya membuktikan konfigurasi; tidak membuktikan driver
+          # userspace/app kompatibel. Simpan informasi source untuk diagnosis.
+          {
+            echo "## Pemeriksaan source KernelSU"
+            echo '```'
+            git grep -n -E 'KSU_NEXT|KernelSU-Next|SukiSU|SUSFS' -- '*Kconfig*' '*Makefile*' 'drivers/*' 2>/dev/null | head -100 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Fix konflik simbol ath9k_htc vs qcacld
         if: ${{ inputs.nethunter }}
@@ -251,6 +292,7 @@ jobs:
           path: |
             build.log
             final.config
+            merged.config
           if-no-files-found: ignore
 
       - name: Simpan cache ccache
