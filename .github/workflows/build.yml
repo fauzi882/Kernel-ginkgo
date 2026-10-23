@@ -27,8 +27,8 @@ on:
         type: boolean
         default: true
       susfs_branch:
-        description: "Branch susfs4ksu (sesuaikan versi kernel)"
-        default: "gki-android11-4.14"
+        description: "Branch susfs4ksu (kernel-4.14 untuk RN8 non-GKI)"
+        default: "kernel-4.14"
       enable_nethunter_wifi:
         description: "Patch monitor mode WiFi (eksperimental)"
         type: boolean
@@ -108,8 +108,8 @@ jobs:
           echo "==== Resolving SuSFS ===="
           SUSFS_REF=$(resolve_ref "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH")
           if [ -z "$SUSFS_REF" ]; then
-            echo "Branch '$SUSFS_BRANCH' tidak ditemukan, coba branch lain untuk kernel 4.14..."
-            for br in gki-android11-4.14 gki-android10-4.14 non-gki-android11-4.14 non-gki; do
+            echo "Branch '$SUSFS_BRANCH' tidak ditemukan, coba branch yang tersedia..."
+            for br in kernel-4.14 kernel-4.19 kernel-4.9 kernel-5.4 gki-android12-5.10; do
               SUSFS_REF=$(resolve_ref "https://gitlab.com/simonpunk/susfs4ksu.git" "$br")
               if [ -n "$SUSFS_REF" ]; then
                 SUSFS_BRANCH="$br"
@@ -118,7 +118,7 @@ jobs:
               fi
             done
           fi
-          [ -n "$SUSFS_REF" ] || { echo "ERROR: susfs4ksu tidak ditemukan di semua branch 4.14"; exit 1; }
+          [ -n "$SUSFS_REF" ] || { echo "ERROR: susfs4ksu tidak ditemukan di semua branch yang dicoba"; exit 1; }
           echo "SuSFS: $SUSFS_BRANCH => $SUSFS_REF"
 
           echo "ksu_ref=$KSU_REF" >> "$GITHUB_OUTPUT"
