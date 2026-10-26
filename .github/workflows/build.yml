@@ -69,6 +69,7 @@ jobs:
       bakasu_ref: ${{ steps.rv.outputs.bakasu_ref }}
       bakasu_branch: ${{ steps.rv.outputs.bakasu_branch }}
       susfs_ref: ${{ steps.rv.outputs.susfs_ref }}
+      susfs_branch_resolved: ${{ steps.rv.outputs.susfs_branch_resolved }}
     steps:
       - name: Resolve versi terbaru otomatis
         id: rv
@@ -107,19 +108,20 @@ jobs:
 
           echo "==== Resolving SuSFS ===="
           SUSFS_REF=$(resolve_ref "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH")
+          SUSFS_BRANCH_RESOLVED="$SUSFS_BRANCH"
           if [ -z "$SUSFS_REF" ]; then
-            echo "Branch '$SUSFS_BRANCH' tidak ditemukan, coba branch yang tersedia..."
+            echo "Branch '$SUSFS_BRANCH' tidak ketemu, coba branch lain..."
             for br in kernel-4.14 kernel-4.19 kernel-4.9 kernel-5.4 gki-android12-5.10; do
               SUSFS_REF=$(resolve_ref "https://gitlab.com/simonpunk/susfs4ksu.git" "$br")
               if [ -n "$SUSFS_REF" ]; then
-                SUSFS_BRANCH="$br"
-                echo "Fallback ke branch: $br => $SUSFS_REF"
+                SUSFS_BRANCH_RESOLVED="$br"
+                echo "Pakai fallback branch: $br => $SUSFS_REF"
                 break
               fi
             done
           fi
-          [ -n "$SUSFS_REF" ] || { echo "ERROR: susfs4ksu tidak ditemukan di semua branch yang dicoba"; exit 1; }
-          echo "SuSFS: $SUSFS_BRANCH => $SUSFS_REF"
+          [ -n "$SUSFS_REF" ] || { echo "ERROR: susfs4ksu tidak ditemukan"; exit 1; }
+          echo "SuSFS: $SUSFS_BRANCH_RESOLVED => $SUSFS_REF"
 
           echo "ksu_ref=$KSU_REF" >> "$GITHUB_OUTPUT"
           echo "ksu_repo=$KSU_REPO" >> "$GITHUB_OUTPUT"
@@ -127,11 +129,12 @@ jobs:
           echo "bakasu_ref=$BAKASU_REF" >> "$GITHUB_OUTPUT"
           echo "bakasu_branch=$BAKASU_BRANCH_RESOLVED" >> "$GITHUB_OUTPUT"
           echo "susfs_ref=$SUSFS_REF" >> "$GITHUB_OUTPUT"
+          echo "susfs_branch_resolved=$SUSFS_BRANCH_RESOLVED" >> "$GITHUB_OUTPUT"
 
-          echo "=== SUMMARY VERSI TERBARU ==="
+          echo "=== VERSI TERBARU ==="
           echo "  KSU Next  : $KSU_REPO @ $KSU_BRANCH => $KSU_REF"
           echo "  BakaSU    : Baka-SU/BakaSU @ $BAKASU_BRANCH_RESOLVED => $BAKASU_REF"
-          echo "  SuSFS     : simonpunk/susfs4ksu @ $SUSFS_BRANCH => $SUSFS_REF"
+          echo "  SuSFS     : simonpunk/susfs4ksu @ $SUSFS_BRANCH_RESOLVED => $SUSFS_REF"
 
   build-kernel:
     runs-on: ubuntu-latest
@@ -145,6 +148,7 @@ jobs:
       BAKASU_REF: ${{ needs.resolve-versions.outputs.bakasu_ref }}
       BAKASU_BRANCH: ${{ needs.resolve-versions.outputs.bakasu_branch }}
       SUSFS_REF: ${{ needs.resolve-versions.outputs.susfs_ref }}
+      SUSFS_BRANCH_RESOLVED: ${{ needs.resolve-versions.outputs.susfs_branch_resolved }}
 
     steps:
 
@@ -177,24 +181,18 @@ jobs:
           echo "=== Versi kernel ==="
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) ' Makefile || true
           git log -1 --format='%h %s (%cd)' || true
-          echo "=== Semua defconfig yang tersedia ==="
+          echo "=== Defconfig tersedia ==="
           find arch/arm64/configs -name '*.defconfig' | sort
-          find arch/arm64/configs -name '*ginkgo*' -o -name '*willow*' \
-            -o -name '*trinket*' 2>/dev/null | sort || true
-          echo "=== KSU/SuSFS status ==="
-          ls -d drivers/kernelsu* 2>/dev/null || echo "(belum ada drivers/kernelsu)"
+          echo "=== KSU status (cek apakah sudah built-in) ==="
+          if [ -d drivers/kernelsu ]; then
+            echo "FOUND: drivers/kernelsu sudah ada"
+            ls drivers/kernelsu/
+          else
+            echo "NOT FOUND: drivers/kernelsu belum ada"
+          fi
           grep -rIl -i susfs --exclude-dir=.git \
             --include='*.c' --include='*.h' \
             --include='Kconfig' --include='Makefile' . 2>/dev/null | head -n 5 || true
-          echo "=== GPS driver ==="
-          find . -maxdepth 4 -type d \( -iname '*gnss*' -o -iname '*gps*' \) \
-            2>/dev/null | grep -v '\.git' | head -n 5 || true
-          echo "=== WiFi driver ==="
-          find . -maxdepth 4 -type d \( -iname 'qcacld*' -o -iname '*wlan*' \) \
-            2>/dev/null | grep -v '\.git' | head -n 5 || true
-          echo "=== Audio ASoC ==="
-          find . -maxdepth 5 -type d \( -iname '*codec*' -o -iname '*wcd*' \) \
-            2>/dev/null | grep -v '\.git' | head -n 10 || true
 
       - name: Cari defconfig yang valid
         working-directory: kernel-source
@@ -202,7 +200,6 @@ jobs:
           DEFCONFIG: ${{ inputs.defconfig }}
         run: |
           DEF_PATH=$(find arch/arm64/configs -name "$DEFCONFIG" 2>/dev/null | head -n1)
-
           if [ -z "$DEF_PATH" ]; then
             echo "defconfig '$DEFCONFIG' tidak ditemukan, cari alternatif..."
             for candidate in \
@@ -218,81 +215,105 @@ jobs:
               FOUND=$(find arch/arm64/configs -name "$candidate" 2>/dev/null | head -n1)
               if [ -n "$FOUND" ]; then
                 DEF_PATH="$FOUND"
-                echo "Pakai defconfig: $DEF_PATH"
+                echo "Pakai: $DEF_PATH"
                 break
               fi
             done
           fi
-
           if [ -z "$DEF_PATH" ]; then
-            echo "ERROR: Tidak ada defconfig yang cocok ditemukan"
-            echo "Defconfig tersedia:"
+            echo "ERROR: Tidak ada defconfig yang cocok"
             find arch/arm64/configs -name '*.defconfig' | sort
             exit 1
           fi
-
-          DEFCONFIG_NAME=$(basename "$DEF_PATH")
-          DEFCONFIG_REL="$DEF_PATH"
-          DEFCONFIG_REL="${DEFCONFIG_REL#arch/arm64/configs/}"
+          DEFCONFIG_REL="${DEF_PATH#arch/arm64/configs/}"
           echo "DEFCONFIG_REL=$DEFCONFIG_REL" >> "$GITHUB_ENV"
           echo "DEF_PATH=$DEF_PATH" >> "$GITHUB_ENV"
-          echo "=== Pakai defconfig: $DEF_PATH ($DEFCONFIG_NAME) ==="
+          echo "=== Pakai defconfig: $DEF_PATH ==="
 
-      - name: Integrasi root solution
+      - name: Integrasi root solution (dengan bersihkan yang lama)
         working-directory: kernel-source
         env:
           ROOT_SOLUTION: ${{ inputs.root_solution }}
           ENABLE_SUSFS: ${{ inputs.enable_susfs }}
         run: |
+          echo "=== Bersihkan folder KSU lama jika ada ==="
+          if [ -d drivers/kernelsu ]; then
+            echo "NOTICE: drivers/kernelsu sudah ada, hapus dulu..."
+            rm -rf drivers/kernelsu
+          fi
+          for d in KernelSU KernelSU-Next kernelsu; do
+            [ -d "$d" ] || [ -L "$d" ] && rm -rf "$d" && echo "Hapus: $d" || true
+          done
+
           if [ "$ROOT_SOLUTION" = "bakasu" ]; then
-            SETUP_URL="https://raw.githubusercontent.com/Baka-SU/BakaSU/${BAKASU_REF}/kernel/setup.sh"
+            USE_REPO="Baka-SU/BakaSU"
             USE_REF="$BAKASU_REF"
-            echo "=== BakaSU @ $BAKASU_BRANCH ($BAKASU_REF) ==="
+            USE_BRANCH="$BAKASU_BRANCH"
+            echo "=== BakaSU @ $USE_BRANCH ($USE_REF) ==="
           else
-            SETUP_URL="https://raw.githubusercontent.com/${KSU_REPO}/${KSU_REF}/kernel/setup.sh"
+            USE_REPO="$KSU_REPO"
             USE_REF="$KSU_REF"
-            echo "=== KSU Next @ $KSU_BRANCH ($KSU_REF) ==="
+            USE_BRANCH="$KSU_BRANCH"
+            echo "=== KSU Next @ $USE_BRANCH ($USE_REF) ==="
           fi
 
-          if curl -fLsS "$SETUP_URL" -o setup.sh; then
-            bash setup.sh "$USE_REF"
-            rm -f setup.sh
+          echo "=== Coba setup.sh resmi ==="
+          SETUP_URL="https://raw.githubusercontent.com/${USE_REPO}/${USE_REF}/kernel/setup.sh"
+          SETUP_OK=false
+
+          if curl -fLsS --max-time 30 "$SETUP_URL" -o /tmp/setup.sh 2>/dev/null; then
+            if bash /tmp/setup.sh "$USE_REF" 2>&1; then
+              if [ -d drivers/kernelsu ] && [ -f drivers/kernelsu/Kconfig ]; then
+                SETUP_OK=true
+                echo "=== setup.sh berhasil ==="
+              else
+                echo "=== setup.sh jalan tapi drivers/kernelsu tidak terbentuk, coba legacy ==="
+              fi
+            else
+              echo "=== setup.sh exit error, coba legacy ==="
+            fi
+            rm -f /tmp/setup.sh
           else
-            echo "setup.sh gagal, fallback clone manual..."
-            git clone --depth=1 -b "$KSU_BRANCH" \
-              "https://github.com/${KSU_REPO}.git" /tmp/ksu-src
-            cp -r /tmp/ksu-src/kernel drivers/kernelsu
-            grep -q 'kernelsu' drivers/Makefile || \
-              echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-            grep -q 'kernelsu' drivers/Kconfig || \
-              sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-            rm -rf /tmp/ksu-src
+            echo "=== setup.sh tidak bisa diunduh, langsung legacy ==="
           fi
 
-          test -e drivers/kernelsu/Kconfig || {
-            echo "ERROR: root solution gagal (drivers/kernelsu tidak terbentuk)"
-            exit 1
-          }
+          if [ "$SETUP_OK" = "false" ]; then
+            echo "=== Legacy method: clone + copy kernel/ => drivers/kernelsu ==="
+            rm -rf drivers/kernelsu
+            CLONE_URL="https://github.com/${USE_REPO}.git"
+            git clone --depth=1 -b "$USE_BRANCH" "$CLONE_URL" /tmp/ksu-src 2>&1 || \
+              git clone --depth=1 "$CLONE_URL" /tmp/ksu-src 2>&1
+            git -C /tmp/ksu-src log -1 --format='%h %s'
+            cp -r /tmp/ksu-src/kernel/. drivers/kernelsu/
+            rm -rf /tmp/ksu-src
+            echo "=== Legacy copy selesai ==="
+          fi
+
+          echo "=== Pastiin Makefile dan Kconfig ==="
+          grep -q 'kernelsu' drivers/Makefile 2>/dev/null || \
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q 'kernelsu' drivers/Kconfig 2>/dev/null || \
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          echo "=== Verifikasi akhir ==="
+          test -f drivers/kernelsu/Kconfig || { echo "ERROR: Kconfig tidak ada"; exit 1; }
+          test -f drivers/kernelsu/Makefile || { echo "ERROR: Makefile tidak ada"; exit 1; }
           echo "=== Integrasi berhasil ==="
-          grep -n kernelsu drivers/Makefile drivers/Kconfig
+          ls -la drivers/kernelsu/
+          grep kernelsu drivers/Makefile
+          grep -rhoE 'config [A-Z_]+' drivers/kernelsu/Kconfig | sort -u
 
       - name: Patch SuSFS
         if: ${{ inputs.enable_susfs }}
         working-directory: kernel-source
-        env:
-          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
         run: |
-          git clone --depth=1 -b "$SUSFS_BRANCH" \
+          echo "=== Clone SuSFS branch: $SUSFS_BRANCH_RESOLVED ==="
+          git clone --depth=1 -b "$SUSFS_BRANCH_RESOLVED" \
             https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
-          echo "=== SuSFS commit ==="
           git -C ../susfs4ksu log -1 --format='%h %s (%cd)'
 
           PATCH=$(ls ../susfs4ksu/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -n1)
-          if [ -z "$PATCH" ]; then
-            echo "WARNING: patch 50_add_susfs tidak ditemukan, cari patch lain..."
-            PATCH=$(ls ../susfs4ksu/kernel_patches/*.patch 2>/dev/null | head -n1)
-          fi
-          [ -n "$PATCH" ] || { echo "ERROR: tidak ada patch SuSFS yang ditemukan"; exit 1; }
+          [ -n "$PATCH" ] || { echo "ERROR: patch 50_add_susfs tidak ada"; exit 1; }
           echo "Patch: $PATCH"
 
           if ! patch -p1 --dry-run --forward < "$PATCH" > /tmp/dry.log 2>&1; then
@@ -300,7 +321,7 @@ jobs:
             if grep -qi "previously applied" /tmp/dry.log; then
               echo "NOTICE: SuSFS sudah built-in. Lanjut."
             else
-              echo "ERROR: Patch SuSFS tidak cocok, cek susfs_branch vs versi kernel"
+              echo "ERROR: Patch SuSFS tidak cocok, cek susfs_branch"
               exit 1
             fi
           else
@@ -312,7 +333,7 @@ jobs:
           [ -d "$SRC/fs" ]            && cp -rn "$SRC/fs/."           fs/
           [ -d "$SRC/include/linux" ] && cp -rn "$SRC/include/linux/." include/linux/
           test -f include/linux/susfs.h || { echo "ERROR: susfs.h tidak ada"; exit 1; }
-          echo "=== SuSFS berhasil ==="
+          echo "=== SuSFS patch berhasil ==="
 
       - name: Patch NetHunter WiFi monitor mode
         if: ${{ inputs.enable_nethunter_wifi }}
@@ -367,7 +388,7 @@ jobs:
           echo "CONFIG_CPU_THERMAL=y" >> "$DEF_PATH"
 
           echo "" >> "$DEF_PATH"
-          echo "# TCP BBR BBR2 Jaringan" >> "$DEF_PATH"
+          echo "# TCP BBR BBR2" >> "$DEF_PATH"
           echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$DEF_PATH"
           echo "CONFIG_TCP_CONG_BBR=y" >> "$DEF_PATH"
           echo "CONFIG_TCP_CONG_BBR2=y" >> "$DEF_PATH"
@@ -388,8 +409,6 @@ jobs:
           echo "CONFIG_NETFILTER_NETLINK=y" >> "$DEF_PATH"
           echo "CONFIG_NETFILTER_NETLINK_QUEUE=y" >> "$DEF_PATH"
           echo "CONFIG_NETFILTER_XT_TARGET_NFQUEUE=y" >> "$DEF_PATH"
-          echo "CONFIG_NETFILTER_XT_TARGET_HL=y" >> "$DEF_PATH"
-          echo "CONFIG_NETFILTER_XT_MATCH_HL=y" >> "$DEF_PATH"
           echo "CONFIG_IP_NF_IPTABLES=y" >> "$DEF_PATH"
           echo "CONFIG_IP_NF_MANGLE=y" >> "$DEF_PATH"
           echo "CONFIG_IP6_NF_IPTABLES=y" >> "$DEF_PATH"
@@ -442,7 +461,6 @@ jobs:
           echo "CONFIG_ANDROID_LOW_MEMORY_KILLER=y" >> "$DEF_PATH"
           echo "CONFIG_ANDROID_SIMPLE_LMK=y" >> "$DEF_PATH"
           echo "CONFIG_QPNP_SMB5=y" >> "$DEF_PATH"
-          echo "CONFIG_SMB1355=y" >> "$DEF_PATH"
 
           echo "" >> "$DEF_PATH"
           echo "# Display Video Codec" >> "$DEF_PATH"
@@ -468,14 +486,12 @@ jobs:
           echo "CONFIG_USB_CONFIGFS_MASS_STORAGE=y" >> "$DEF_PATH"
 
           echo "" >> "$DEF_PATH"
-          echo "# Security Hardening" >> "$DEF_PATH"
+          echo "# Security" >> "$DEF_PATH"
           echo "CONFIG_STACKPROTECTOR_STRONG=y" >> "$DEF_PATH"
           echo "CONFIG_FORTIFY_SOURCE=y" >> "$DEF_PATH"
           echo "CONFIG_HARDENED_USERCOPY=y" >> "$DEF_PATH"
           echo "CONFIG_SECURITY_DMESG_RESTRICT=y" >> "$DEF_PATH"
           echo "CONFIG_RANDOMIZE_BASE=y" >> "$DEF_PATH"
-          echo "CONFIG_SLAB_FREELIST_RANDOM=y" >> "$DEF_PATH"
-          echo "CONFIG_SLAB_FREELIST_HARDENED=y" >> "$DEF_PATH"
 
           if [ "$ENABLE_ZRAM" = "true" ]; then
             echo "" >> "$DEF_PATH"
@@ -509,7 +525,7 @@ jobs:
 
           if [ "$ENABLE_DOLBY" = "true" ]; then
             echo "" >> "$DEF_PATH"
-            echo "# Audio Dolby Atmos (Snapdragon 665 / trinket)" >> "$DEF_PATH"
+            echo "# Audio Dolby Atmos SD665" >> "$DEF_PATH"
             echo "CONFIG_SND=y" >> "$DEF_PATH"
             echo "CONFIG_SND_SOC=y" >> "$DEF_PATH"
             echo "CONFIG_SND_SOC_MSM8X16_WCD=y" >> "$DEF_PATH"
@@ -519,7 +535,6 @@ jobs:
             echo "CONFIG_MSM_QDSP6V2=y" >> "$DEF_PATH"
             echo "CONFIG_AUDIO_ADSP=y" >> "$DEF_PATH"
             echo "CONFIG_SND_SOC_MSM_QDSP6V2_INTF=y" >> "$DEF_PATH"
-            echo "CONFIG_AUDIO_EXT_CLK=y" >> "$DEF_PATH"
             echo "CONFIG_USB_AUDIO=y" >> "$DEF_PATH"
             echo "CONFIG_SND_USB_AUDIO=y" >> "$DEF_PATH"
             echo "CONFIG_SND_HRTIMER=y" >> "$DEF_PATH"
@@ -552,7 +567,6 @@ jobs:
         run: |
           echo "" >> "$DEF_PATH"
           echo "CONFIG_KSU=y" >> "$DEF_PATH"
-
           if [ "$ENABLE_SUSFS" = "true" ]; then
             echo "CONFIG_KSU_SUSFS=y" >> "$DEF_PATH"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEF_PATH"
@@ -563,7 +577,7 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEF_PATH"
             echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEF_PATH"
           fi
-          echo "=== KSU/SuSFS symbols ditambahkan ==="
+          echo "=== KSU/SuSFS symbols selesai ==="
 
       - name: Buat runtime scripts ZRAM dan BBR
         run: |
@@ -605,7 +619,6 @@ jobs:
           chmod +x runtime-scripts/system/etc/init.d/00-zram.sh
           chmod +x runtime-scripts/system/etc/init.d/01-bbr.sh
           echo "=== Runtime scripts selesai ==="
-          ls -la runtime-scripts/system/etc/init.d/
 
       - name: Compile kernel
         working-directory: kernel-source
@@ -613,10 +626,8 @@ jobs:
           ENABLE_SUSFS: ${{ inputs.enable_susfs }}
         run: |
           MAKE_ARGS=(
-            O=out
-            ARCH=arm64
-            LLVM=1
-            LLVM_IAS=1
+            O=out ARCH=arm64
+            LLVM=1 LLVM_IAS=1
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
@@ -640,9 +651,9 @@ jobs:
             }
           fi
 
-          echo "=== Status fitur upgrade ==="
-          grep -E "^CONFIG_(TCP_CONG_BBR|TCP_CONG_BBR2|ZRAM|ENERGY_MODEL|GNSS|OVERLAY_FS|SND_SOC_WCD9XXX|ANDROID_BINDER_IPC)" \
-            out/.config || echo "(beberapa config mungkin tidak tersedia)"
+          echo "=== Status fitur ==="
+          grep -E "^CONFIG_(TCP_CONG_BBR|ZRAM|ENERGY_MODEL|GNSS|OVERLAY_FS|SND_SOC_WCD9XXX)" \
+            out/.config || true
 
           make -j"$(nproc)" "${MAKE_ARGS[@]}" Image 2>&1 | tee build.log
           make "${MAKE_ARGS[@]}" modules_prepare
@@ -693,16 +704,13 @@ jobs:
             -e 's|^IS_SLOT_DEVICE=.*|IS_SLOT_DEVICE=0;|' \
             anykernel.sh
 
-          echo "=== Verifikasi anykernel.sh ==="
-          grep -nE '^(kernel.string|device.name|BLOCK|IS_SLOT_DEVICE)' anykernel.sh
-
           zip -r9 "../$ZIP_NAME" . \
             -x '.git/*' -x '.github/*' \
             -x 'README.md' -x '*placeholder'
 
           cd ..
           test -f "$ZIP_NAME" || { echo "ERROR: ZIP tidak terbentuk"; exit 1; }
-          echo "=== ZIP selesai: $(du -sh $ZIP_NAME) ==="
+          echo "=== ZIP: $(du -sh $ZIP_NAME) ==="
 
       - name: Upload kernel ZIP
         uses: actions/upload-artifact@v4
@@ -729,24 +737,19 @@ jobs:
       - name: Build summary
         if: success()
         run: |
-          echo "## Build Selesai - Redmi Note 8 Ginkgo/Willow Upgraded" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Build Selesai - Redmi Note 8 Ginkgo/Willow" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Fitur | Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Device | ginkgo / willow (Redmi Note 8) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Chipset | Snapdragon 665 (trinket) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Root: ${{ inputs.root_solution }} (auto latest) | OK |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SuSFS | ${{ inputs.enable_susfs }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| FPS Gaming (WALT + Kyber) | OK |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| TCP BBR / BBR2 + CAKE | OK |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Sinyal WiFi/BT stabil | OK |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| GPS GNSS + HiRes Timer | OK |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Overclock/UV sysfs | ${{ inputs.enable_overclock }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ZRAM LZ4/ZSTD | ${{ inputs.enable_zram }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Video/Display (Venus+DRM) | OK |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Audio Dolby (WCD934X+ADSP) | ${{ inputs.enable_dolby }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Efisiensi Baterai (EAS+LMK) | OK |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Google Play bypass | ${{ inputs.enable_gplay_bypass }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SuSFS branch | $SUSFS_BRANCH_RESOLVED |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| FPS Gaming + BBR2 + GPS | OK |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ZRAM | ${{ inputs.enable_zram }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Overclock/UV | ${{ inputs.enable_overclock }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dolby Audio | ${{ inputs.enable_dolby }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| GPlay bypass | ${{ inputs.enable_gplay_bypass }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "KSU ref   : $KSU_REF" >> "$GITHUB_STEP_SUMMARY"
           echo "SuSFS ref : $SUSFS_REF" >> "$GITHUB_STEP_SUMMARY"
