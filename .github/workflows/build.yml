@@ -278,30 +278,75 @@ jobs:
           fi
 
           if [ "$SETUP_OK" = "false" ]; then
-            echo "=== Legacy method: clone + copy kernel/ => drivers/kernelsu ==="
+            echo "=== Legacy method: clone + copy kernel/ => drivers/kernelsu/kernel/ ==="
             rm -rf drivers/kernelsu
             CLONE_URL="https://github.com/${USE_REPO}.git"
-            git clone --depth=1 -b "$USE_BRANCH" "$CLONE_URL" /tmp/ksu-src 2>&1 || \
-              git clone --depth=1 "$CLONE_URL" /tmp/ksu-src 2>&1
+            git clone --depth=1 -b "$USE_BRANCH" "$CLONE_URL" /tmp/ksu-src 2>&1 ||               git clone --depth=1 "$CLONE_URL" /tmp/ksu-src 2>&1
             git -C /tmp/ksu-src log -1 --format='%h %s'
-            cp -r /tmp/ksu-src/kernel/. drivers/kernelsu/
+
+            # Cek struktur KSU repo: ada folder kernel/ atau langsung file?
+            if [ -d /tmp/ksu-src/kernel ]; then
+              echo "Struktur: repo punya subfolder kernel/"
+              # Source ini (flop_trinket) expect drivers/kernelsu/kernel/Kconfig
+              # Jadi copy jadi drivers/kernelsu/kernel/
+              mkdir -p drivers/kernelsu/kernel
+              cp -r /tmp/ksu-src/kernel/. drivers/kernelsu/kernel/
+              # Buat Makefile wrapper di drivers/kernelsu/
+              echo 'obj-$(CONFIG_KSU) += kernel/' > drivers/kernelsu/Makefile
+            else
+              echo "Struktur: repo tidak punya subfolder kernel/, copy langsung"
+              mkdir -p drivers/kernelsu
+              cp -r /tmp/ksu-src/. drivers/kernelsu/
+            fi
             rm -rf /tmp/ksu-src
             echo "=== Legacy copy selesai ==="
+            echo "=== Isi drivers/kernelsu/ ==="
+            ls -la drivers/kernelsu/
           fi
 
-          echo "=== Pastiin Makefile dan Kconfig ==="
-          grep -q 'kernelsu' drivers/Makefile 2>/dev/null || \
-            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-          grep -q 'kernelsu' drivers/Kconfig 2>/dev/null || \
-            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          echo "=== Pastiin drivers/Makefile dan drivers/Kconfig ==="
+          grep -q 'kernelsu' drivers/Makefile 2>/dev/null ||             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+
+          # Cek path Kconfig yang benar (kernel/Kconfig atau Kconfig langsung)
+          if [ -f drivers/kernelsu/kernel/Kconfig ]; then
+            KSU_KCONFIG_PATH="drivers/kernelsu/kernel/Kconfig"
+          elif [ -f drivers/kernelsu/Kconfig ]; then
+            KSU_KCONFIG_PATH="drivers/kernelsu/Kconfig"
+          else
+            echo "ERROR: Kconfig tidak ditemukan di drivers/kernelsu/"
+            find drivers/kernelsu/ -name 'Kconfig' 2>/dev/null || true
+            exit 1
+          fi
+          echo "KSU Kconfig path: $KSU_KCONFIG_PATH"
+
+          # Update drivers/Kconfig agar source ke path yang benar
+          if ! grep -q "$KSU_KCONFIG_PATH" drivers/Kconfig 2>/dev/null; then
+            # Hapus entry kernelsu lama yang mungkin pointing ke path salah
+            sed -i '/source.*kernelsu.*Kconfig/d' drivers/Kconfig 2>/dev/null || true
+            sed -i "/^endmenu/i source "$KSU_KCONFIG_PATH"" drivers/Kconfig
+            echo "=== Ditambahkan ke drivers/Kconfig: $KSU_KCONFIG_PATH ==="
+          fi
+
+          # Cek juga su_variants.Kconfig jika ada — sesuaikan referensinya
+          if [ -f drivers/su_variants.Kconfig ]; then
+            echo "=== Cek drivers/su_variants.Kconfig ==="
+            grep -n 'kernelsu' drivers/su_variants.Kconfig | head -n 10 || true
+            # Jika su_variants.Kconfig reference ke path yang salah, fix
+            SV_REF=$(grep 'kernelsu.*Kconfig' drivers/su_variants.Kconfig | head -n1 |                      grep -oE '"drivers/kernelsu[^"]*"' | tr -d '"' || true)
+            if [ -n "$SV_REF" ] && [ ! -f "$SV_REF" ]; then
+              echo "su_variants.Kconfig reference ke $SV_REF yang tidak ada, fix..."
+              sed -i "s|source "$SV_REF"|source "$KSU_KCONFIG_PATH"|g"                 drivers/su_variants.Kconfig
+              echo "=== su_variants.Kconfig diperbaiki ==="
+            fi
+          fi
 
           echo "=== Verifikasi akhir ==="
-          test -f drivers/kernelsu/Kconfig || { echo "ERROR: Kconfig tidak ada"; exit 1; }
-          test -f drivers/kernelsu/Makefile || { echo "ERROR: Makefile tidak ada"; exit 1; }
+          test -f "$KSU_KCONFIG_PATH" || { echo "ERROR: $KSU_KCONFIG_PATH tidak ada"; exit 1; }
           echo "=== Integrasi berhasil ==="
           ls -la drivers/kernelsu/
-          grep kernelsu drivers/Makefile
-          grep -rhoE 'config [A-Z_]+' drivers/kernelsu/Kconfig | sort -u
+          grep kernelsu drivers/Makefile || true
+          echo "=== Config symbols ==="
+          grep -rhoE 'config [A-Z_]+' drivers/kernelsu/ --include='Kconfig' | sort -u
 
       - name: Patch SuSFS
         if: ${{ inputs.enable_susfs }}
